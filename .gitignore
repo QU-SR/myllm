@@ -1,0 +1,43 @@
+# 编译输出
+*.exe
+myllm
+
+# 打包/发布目录
+release/
+
+# 后端二进制（体积大，单独下载）
+backends/
+
+# 模型文件（体积大，通过 pull 下载）
+models/
+
+# 下载缓存
+cache/
+
+# 运行日志
+logs/
+
+# 临时文件
+tmp/
+
+# 配置（含本地路径，不提交）
+config/config.json
+
+# Ollama 清单缓存
+manifests/
+
+# Go 测试与构建缓存
+*.test
+*.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
