@@ -133,6 +133,14 @@ myllm/
 
 将 `llama-server`（Linux/macOS）或 `llama-server.exe`（Windows）放入 `backends/` 目录。
 
+Windows 下建议直接使用官方 `llama.cpp` 发布包里的整套文件，而不是只拷贝 `llama-server.exe`。除了 `llama.dll`、`ggml-*.dll` 之外，通常还需要这些运行时 DLL 一起分发到 `backends/`：
+
+- `MSVCP140.dll`
+- `VCRUNTIME140.dll`
+- `VCRUNTIME140_1.dll`
+
+`myllm doctor` 会检查这些 DLL 是否齐全；程序启动时也会优先尝试从当前系统自动补齐到 `backends/`。如果目标机器没有安装 Visual C++ Redistributable，就必须把这些 DLL 随程序一起打包。
+
 程序会在每次提问时自动启动后端进程、完成推理后关闭，不会留下常驻后台服务（除非启用了模型常驻模式）。
 
 ## 技术栈

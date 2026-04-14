@@ -111,6 +111,7 @@ type residentServerManager struct {
 }
 
 var sharedServer residentServerManager
+var windowsRuntimeDLLs = []string{"MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll"}
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -130,6 +131,9 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 	if err := ensureLayout(layout); err != nil {
+		return err
+	}
+	if err := ensureBackendRuntimeDependencies(layout); err != nil {
 		return err
 	}
 	cfg, err := loadConfig(layout)
@@ -544,6 +548,17 @@ func cmdDoctor(layout Layout) error {
 	if err != nil {
 		fmt.Println("Hint: put llama-server or llama-server.exe into backends/")
 	}
+	if runtime.GOOS == "windows" {
+		missing, missErr := missingWindowsRuntimeDLLs(layout.BackendsDir)
+		if missErr != nil {
+			return missErr
+		}
+		fmt.Printf("Windows VC++ runtime DLLs present: %t\n", len(missing) == 0)
+		if len(missing) > 0 {
+			fmt.Printf("Missing DLLs: %s\n", strings.Join(missing, ", "))
+			fmt.Println("Hint: bundle the full official Windows llama.cpp package, or copy these DLLs into backends/.")
+		}
+	}
 	return nil
 }
 
@@ -748,6 +763,15 @@ func startServer(ctx context.Context, layout Layout, cfg Config, model LocalMode
 	if _, err := os.Stat(layout.BackendExePath); err != nil {
 		return nil, "", fmt.Errorf("backend binary not found at %s", layout.BackendExePath)
 	}
+	if runtime.GOOS == "windows" {
+		missing, err := missingWindowsRuntimeDLLs(layout.BackendsDir)
+		if err != nil {
+			return nil, "", err
+		}
+		if len(missing) > 0 {
+			return nil, "", fmt.Errorf("llama-server is missing Windows runtime DLLs in backends/: %s", strings.Join(missing, ", "))
+		}
+	}
 
 	args := []string{
 		"--host", "127.0.0.1",
@@ -921,6 +945,120 @@ func summarizeServerOutput(output string) string {
 		text = text[:500] + "..."
 	}
 	return text
+}
+
+func ensureBackendRuntimeDependencies(layout Layout) error {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	if _, err := os.Stat(layout.BackendExePath); err != nil {
+		return nil
+	}
+
+	missing, err := missingWindowsRuntimeDLLs(layout.BackendsDir)
+	if err != nil || len(missing) == 0 {
+		return err
+	}
+
+	_, unresolved, err := copyWindowsRuntimeDLLs(layout.BackendsDir, missing)
+	if err != nil {
+		return err
+	}
+	if len(unresolved) > 0 {
+		return nil
+	}
+	return nil
+}
+
+func missingWindowsRuntimeDLLs(backendsDir string) ([]string, error) {
+	if runtime.GOOS != "windows" {
+		return nil, nil
+	}
+	missing := make([]string, 0)
+	for _, name := range windowsRuntimeDLLs {
+		full := filepath.Join(backendsDir, name)
+		info, err := os.Stat(full)
+		if os.IsNotExist(err) {
+			missing = append(missing, name)
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if info.IsDir() {
+			missing = append(missing, name)
+		}
+	}
+	return missing, nil
+}
+
+func copyWindowsRuntimeDLLs(dstDir string, names []string) ([]string, []string, error) {
+	if len(names) == 0 {
+		return nil, nil, nil
+	}
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		return nil, nil, err
+	}
+
+	copied := make([]string, 0, len(names))
+	unresolved := make([]string, 0)
+	for _, name := range names {
+		src, err := findWindowsRuntimeDLL(name)
+		if err != nil {
+			return nil, nil, err
+		}
+		if src == "" {
+			unresolved = append(unresolved, name)
+			continue
+		}
+		if err := copyFile(filepath.Join(dstDir, name), src); err != nil {
+			return nil, nil, err
+		}
+		copied = append(copied, name)
+	}
+	return copied, unresolved, nil
+}
+
+func findWindowsRuntimeDLL(name string) (string, error) {
+	searchDirs := []string{}
+	if systemRoot := strings.TrimSpace(os.Getenv("SystemRoot")); systemRoot != "" {
+		searchDirs = append(searchDirs,
+			filepath.Join(systemRoot, "System32"),
+			filepath.Join(systemRoot, "SysWOW64"),
+		)
+	}
+	if windir := strings.TrimSpace(os.Getenv("WINDIR")); windir != "" {
+		searchDirs = append(searchDirs,
+			filepath.Join(windir, "System32"),
+			filepath.Join(windir, "SysWOW64"),
+		)
+	}
+
+	seen := make(map[string]struct{}, len(searchDirs))
+	for _, dir := range searchDirs {
+		if dir == "" {
+			continue
+		}
+		dir = filepath.Clean(dir)
+		key := strings.ToLower(dir)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		full := filepath.Join(dir, name)
+		info, err := os.Stat(full)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		if !info.IsDir() {
+			return full, nil
+		}
+	}
+	return "", nil
 }
 
 func exitCodeOf(err error) (int, bool) {
@@ -1226,6 +1364,43 @@ func copyModelInto(dstDir, src string) (string, error) {
 		return "", err
 	}
 	return dstAbs, nil
+}
+
+func copyFile(dst, src string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	info, err := srcFile.Stat()
+	if err != nil {
+		return err
+	}
+
+	tmp := dst + ".tmp"
+	dstFile, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		_ = dstFile.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := dstFile.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, info.Mode()); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func downloadToFile(rawURL, dst, label string, progress func(DownloadProgress)) error {
