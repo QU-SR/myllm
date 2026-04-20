@@ -8,10 +8,12 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 )
 
 type uiMode int
@@ -82,9 +84,10 @@ type pullProgressMsg struct {
 }
 
 type chatUI struct {
-	ctx    context.Context
-	layout Layout
-	cfg    *Config
+	ctx       context.Context
+	layout    Layout
+	cfg       *Config
+	daemonURL string
 
 	mode uiMode
 
@@ -141,6 +144,7 @@ func runChatUI(ctx context.Context, layout Layout, cfg *Config, session ChatSess
 		ctx:           ctx,
 		layout:        layout,
 		cfg:           cfg,
+		daemonURL:     session.DaemonURL,
 		mode:          modeChat,
 		input:         input,
 		modelName:     session.ModelName,
@@ -159,7 +163,7 @@ func runChatUI(ctx context.Context, layout Layout, cfg *Config, session ChatSess
 		}
 	}
 
-	program := tea.NewProgram(ui)
+	program := tea.NewProgram(ui, tea.WithAltScreen())
 	_, err := program.Run()
 	return err
 }
@@ -176,7 +180,7 @@ func historyToMessages(history []map[string]string) []uiMessage {
 }
 
 func (m chatUI) Init() tea.Cmd {
-	return textinput.Blink
+	return tea.Batch(textinput.Blink, tea.ClearScreen)
 }
 
 func (m chatUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -185,7 +189,7 @@ func (m chatUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.input.Width = max(20, msg.Width-4)
-		return m, nil
+		return m, tea.ClearScreen
 
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -581,7 +585,7 @@ func (m chatUI) executeSlashCommand(name string) (tea.Model, tea.Cmd) {
 		m.history = nil
 		m.messages = nil
 		m.attachments = nil
-		return m, nil
+		return m, tea.ClearScreen
 	case "system":
 		m.mode = modePromptSystem
 		m.input.Placeholder = ""
@@ -708,7 +712,7 @@ func (m chatUI) sendCurrentMessage() (tea.Model, tea.Cmd) {
 	m.input.Reset()
 	m.busy = true
 
-	return m, streamAnswerCmd(m.ctx, m.layout, *m.cfg, model, append([]map[string]string(nil), m.history...), systemPrompt, prompt, images, m.threads, m.contextLength, m.temperature, m.topP)
+	return m, streamAnswerCmd(m.ctx, m.daemonURL, m.layout, *m.cfg, model, append([]map[string]string(nil), m.history...), systemPrompt, prompt, images, m.threads, m.contextLength, m.temperature, m.topP)
 }
 
 func buildUserPrompt(text string, attachments []pendingAttachment) (prompt string, imagePaths []string, display string) {
@@ -737,13 +741,30 @@ func buildUserPrompt(text string, attachments []pendingAttachment) (prompt strin
 	return prompt, imagePaths, display
 }
 
-func streamAnswerCmd(ctx context.Context, layout Layout, cfg Config, model LocalModel, history []map[string]string, systemPrompt, prompt string, images []Image, threads, contextLength int, temperature, topP float64) tea.Cmd {
+func streamAnswerCmd(ctx context.Context, daemonURL string, layout Layout, cfg Config, model LocalModel, history []map[string]string, systemPrompt, prompt string, images []Image, threads, contextLength int, temperature, topP float64) tea.Cmd {
 	return func() tea.Msg {
 		ch := make(chan tea.Msg)
 		go func() {
-			answer, err := invokeModel(ctx, layout, cfg, model, history, systemPrompt, prompt, images, threads, contextLength, temperature, topP, func(token string) {
+			var answer string
+			var err error
+			onToken := func(token string) {
 				ch <- streamTokenMsg{Text: token}
-			})
+			}
+			if strings.TrimSpace(daemonURL) != "" {
+				answer, err = invokeDaemonModel(ctx, daemonURL, daemonChatRequest{
+					ModelName:     model.Name,
+					History:       history,
+					SystemPrompt:  systemPrompt,
+					Prompt:        prompt,
+					Images:        images,
+					Threads:       threads,
+					ContextLength: contextLength,
+					Temperature:   temperature,
+					TopP:          topP,
+				}, time.Duration(cfg.RequestTimeoutSeconds)*time.Second, onToken)
+			} else {
+				answer, err = invokeModel(ctx, layout, cfg, model, history, systemPrompt, prompt, images, threads, contextLength, temperature, topP, onToken)
+			}
 			ch <- streamDoneMsg{Answer: answer, Err: err}
 			close(ch)
 		}()
@@ -937,25 +958,14 @@ func (m *chatUI) appendSystemMessage(text string) {
 }
 
 func (m chatUI) View() string {
-	header := lipgloss.NewStyle().Bold(true).Render("myllm")
+	width := max(20, m.width)
+	height := max(10, m.height)
+	header := "myllm"
 	model := "none"
 	if m.modelName != "" {
 		model = m.modelName
 	}
 	top := fmt.Sprintf("%s  Model: %s", header, model)
-
-	bodyLines := make([]string, 0, len(m.messages)*2)
-	for _, msg := range m.messages {
-		prefix := "Assistant"
-		switch msg.Role {
-		case "user":
-			prefix = "You"
-		case "system":
-			prefix = "System"
-		}
-		bodyLines = append(bodyLines, fmt.Sprintf("%s: %s", prefix, msg.Content))
-	}
-	body := strings.Join(trimToLast(bodyLines, max(8, m.height-10)), "\n")
 
 	renderInput := m.input
 	if prefix := strings.Join(m.attachmentLabels(), " "); prefix != "" {
@@ -963,14 +973,30 @@ func (m chatUI) View() string {
 	} else {
 		renderInput.Prompt = "> "
 	}
+	renderInput.Width = max(8, width-lipgloss.Width(renderInput.Prompt)-1)
 	inputLine := renderInput.View()
 
-	lines := []string{
-		top,
-		body,
-		m.renderDownloadProgress(),
-		inputLine,
+	overlayLines := m.renderOverlayLines()
+	progressLine := m.renderDownloadProgress()
+	reserved := 2 + len(overlayLines)
+	if progressLine != "" {
+		reserved++
 	}
+	bodyHeight := max(1, height-reserved)
+	bodyLines := trimToLast(m.renderMessageLines(width), bodyHeight)
+
+	lines := []string{top}
+	lines = append(lines, bodyLines...)
+	if progressLine != "" {
+		lines = append(lines, progressLine)
+	}
+	lines = append(lines, inputLine)
+	lines = append(lines, overlayLines...)
+	return renderViewport(lines, width, height)
+}
+
+func (m chatUI) renderOverlayLines() []string {
+	lines := []string{}
 	if m.mode == modeSelectModel {
 		lines = append(lines, "", emptyFallback(m.selectTitle, "Select")+":")
 		for i, item := range m.selectItems {
@@ -988,7 +1014,132 @@ func (m chatUI) View() string {
 		lines = append(lines, "")
 		lines = append(lines, m.renderSlashSuggestions()...)
 	}
-	return strings.Join(lines, "\n")
+	return lines
+}
+
+func (m chatUI) renderMessageLines(width int) []string {
+	lines := make([]string, 0, len(m.messages)*2)
+	for _, msg := range m.messages {
+		prefix := "Assistant"
+		switch msg.Role {
+		case "user":
+			prefix = "You"
+		case "system":
+			prefix = "System"
+		}
+		prefix += ": "
+		contentWidth := max(4, width-lipgloss.Width(prefix))
+		wrapped := wrapDisplayText(msg.Content, contentWidth)
+		if len(wrapped) == 0 {
+			lines = append(lines, prefix)
+			continue
+		}
+		indent := strings.Repeat(" ", lipgloss.Width(prefix))
+		for i, line := range wrapped {
+			if i == 0 {
+				lines = append(lines, prefix+line)
+			} else {
+				lines = append(lines, indent+line)
+			}
+		}
+	}
+	if len(lines) == 0 {
+		return []string{""}
+	}
+	return lines
+}
+
+func wrapDisplayText(text string, width int) []string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	paragraphs := strings.Split(text, "\n")
+	lines := make([]string, 0, len(paragraphs))
+	for _, paragraph := range paragraphs {
+		if paragraph == "" {
+			lines = append(lines, "")
+			continue
+		}
+		lines = append(lines, wrapDisplayParagraph(paragraph, width)...)
+	}
+	return lines
+}
+
+func wrapDisplayParagraph(text string, width int) []string {
+	if width <= 0 {
+		return []string{text}
+	}
+	lines := []string{}
+	var line strings.Builder
+	cells := 0
+	for _, r := range text {
+		w := runewidth.RuneWidth(r)
+		if w == 0 {
+			line.WriteRune(r)
+			continue
+		}
+		if cells > 0 && cells+w > width {
+			lines = append(lines, line.String())
+			line.Reset()
+			cells = 0
+		}
+		line.WriteRune(r)
+		cells += w
+	}
+	lines = append(lines, line.String())
+	return lines
+}
+
+func renderViewport(lines []string, width, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	if len(lines) > height {
+		lines = lines[len(lines)-height:]
+	}
+	out := make([]string, 0, height)
+	for _, line := range lines {
+		out = append(out, fitDisplayLine(line, width))
+	}
+	for len(out) < height {
+		out = append(out, strings.Repeat(" ", width))
+	}
+	return strings.Join(out, "\n")
+}
+
+func fitDisplayLine(line string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	visible := lipgloss.Width(line)
+	if visible > width && !strings.Contains(line, "\x1b") {
+		line = truncateDisplayText(line, width)
+		visible = lipgloss.Width(line)
+	}
+	if visible < width {
+		line += strings.Repeat(" ", width-visible)
+	}
+	return line
+}
+
+func truncateDisplayText(text string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	var out strings.Builder
+	cells := 0
+	for _, r := range text {
+		w := runewidth.RuneWidth(r)
+		if w == 0 {
+			out.WriteRune(r)
+			continue
+		}
+		if cells+w > width {
+			break
+		}
+		out.WriteRune(r)
+		cells += w
+	}
+	return out.String()
 }
 
 func (m chatUI) attachmentLabels() []string {

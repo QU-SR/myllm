@@ -24,6 +24,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 type Layout struct {
@@ -42,6 +43,7 @@ type Config struct {
 	ResidentIdleMinutes   int     `json:"resident_idle_minutes"`
 	EnableMMProj          bool    `json:"enable_mmproj"`
 	EnableShellTool       bool    `json:"enable_shell_tool"`
+	DaemonPort            int     `json:"daemon_port"`
 	ServerStartupSeconds  int     `json:"server_startup_seconds"`
 	RequestTimeoutSeconds int     `json:"request_timeout_seconds"`
 	MaxImageBytes         int64   `json:"max_image_bytes"`
@@ -67,7 +69,36 @@ type chatReq struct {
 	Stream      bool             `json:"stream"`
 	Temperature float64          `json:"temperature,omitempty"`
 	TopP        float64          `json:"top_p,omitempty"`
+	Tools       []chatTool       `json:"tools,omitempty"`
+	ToolChoice  any              `json:"tool_choice,omitempty"`
 	ImageData   []map[string]any `json:"image_data,omitempty"`
+}
+
+type chatTool struct {
+	Type     string           `json:"type"`
+	Function chatToolFunction `json:"function"`
+}
+
+type chatToolFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
+}
+
+type chatToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function chatToolCallFunc `json:"function"`
+}
+
+type chatToolCallFunc struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type chatResponse struct {
+	Content   string
+	ToolCalls []chatToolCall
 }
 
 type ChatSession struct {
@@ -78,6 +109,7 @@ type ChatSession struct {
 	ContextLength int
 	Temperature   float64
 	TopP          float64
+	DaemonURL     string
 }
 
 type ollamaManifest struct {
@@ -165,6 +197,8 @@ func run(ctx context.Context, args []string) error {
 		return cmdBench()
 	case "run":
 		return cmdRun(ctx, args[1:], layout, cfg)
+	case "daemon":
+		return cmdDaemon(ctx, layout, cfg)
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -185,6 +219,7 @@ Commands:
   doctor
   bench
   run <name> [prompt text] [--image FILE] [--system-file FILE] [--interactive]
+  daemon
 
 No arguments:
   Start interactive chat UI
@@ -199,6 +234,21 @@ func enableWindowsUTF8Console() {
 	const utf8CodePage = 65001
 	_, _, _ = kernel32.NewProc("SetConsoleOutputCP").Call(uintptr(utf8CodePage))
 	_, _, _ = kernel32.NewProc("SetConsoleCP").Call(uintptr(utf8CodePage))
+	const (
+		stdOutputHandle                 = ^uintptr(10)
+		enableVirtualTerminalProcessing = 0x0004
+	)
+	handle, _, _ := kernel32.NewProc("GetStdHandle").Call(stdOutputHandle)
+	if handle == 0 || handle == ^uintptr(0) {
+		return
+	}
+	var mode uint32
+	getConsoleMode := kernel32.NewProc("GetConsoleMode")
+	setConsoleMode := kernel32.NewProc("SetConsoleMode")
+	if ok, _, _ := getConsoleMode.Call(handle, uintptr(unsafe.Pointer(&mode))); ok == 0 {
+		return
+	}
+	_, _, _ = setConsoleMode.Call(handle, uintptr(mode|enableVirtualTerminalProcessing))
 }
 
 func resolveLayout() (Layout, error) {
@@ -243,10 +293,11 @@ func defaultConfig() Config {
 		DefaultTopP:           0.95,
 		DefaultModel:          "",
 		PerformanceProfile:    "balanced",
-		KeepModelResident:     false,
-		ResidentIdleMinutes:   15,
+		KeepModelResident:     true,
+		ResidentIdleMinutes:   0,
 		EnableMMProj:          true,
 		EnableShellTool:       false,
+		DaemonPort:            48991,
 		ServerStartupSeconds:  45,
 		RequestTimeoutSeconds: 300,
 		MaxImageBytes:         20 * 1024 * 1024,
@@ -269,6 +320,9 @@ func loadConfig(layout Layout) (Config, error) {
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return Config{}, err
+	}
+	if cfg.DaemonPort == 0 {
+		cfg.DaemonPort = defaultConfig().DaemonPort
 	}
 	if !filepath.IsAbs(cfg.DefaultSystemPrompt) {
 		cfg.DefaultSystemPrompt = filepath.Join(layout.Root, cfg.DefaultSystemPrompt)
@@ -593,6 +647,10 @@ func cmdChat(ctx context.Context, args []string, layout Layout, cfg Config) erro
 			initialModel = models[0].Name
 		}
 	}
+	daemonURL, err := ensureDaemon(ctx, layout, cfg)
+	if err != nil {
+		return err
+	}
 
 	return runChatUI(ctx, layout, &cfg, ChatSession{
 		ModelName:     initialModel,
@@ -601,6 +659,7 @@ func cmdChat(ctx context.Context, args []string, layout Layout, cfg Config) erro
 		ContextLength: *contextLen,
 		Temperature:   *temperature,
 		TopP:          *topP,
+		DaemonURL:     daemonURL,
 	})
 }
 
@@ -671,8 +730,23 @@ func cmdRun(ctx context.Context, args []string, layout Layout, cfg Config) error
 		return err
 	}
 
+	daemonURL, err := ensureDaemon(ctx, layout, cfg)
+	if err != nil {
+		return err
+	}
+
 	if prompt != "" {
-		answer, err := invokeModel(ctx, layout, cfg, model, history, systemPrompt, prompt, loadedImages, *threads, *contextLen, *temperature, *topP, func(token string) {
+		answer, err := invokeDaemonModel(ctx, daemonURL, daemonChatRequest{
+			ModelName:     model.Name,
+			History:       history,
+			SystemPrompt:  systemPrompt,
+			Prompt:        prompt,
+			Images:        loadedImages,
+			Threads:       *threads,
+			ContextLength: *contextLen,
+			Temperature:   *temperature,
+			TopP:          *topP,
+		}, time.Duration(cfg.RequestTimeoutSeconds)*time.Second, func(token string) {
 			fmt.Print(token)
 		})
 		fmt.Println()
@@ -690,6 +764,7 @@ func cmdRun(ctx context.Context, args []string, layout Layout, cfg Config) error
 		ContextLength: *contextLen,
 		Temperature:   *temperature,
 		TopP:          *topP,
+		DaemonURL:     daemonURL,
 	})
 }
 
@@ -702,42 +777,64 @@ func invokeModel(ctx context.Context, layout Layout, cfg Config, model LocalMode
 
 	timeout := time.Duration(cfg.RequestTimeoutSeconds) * time.Second
 	activeSystemPrompt := buildEffectiveSystemPrompt(systemPrompt, cfg.EnableShellTool)
-	activeHistory := append([]map[string]string(nil), history...)
-	userPrompt := prompt
-	activeImages := append([]Image(nil), images...)
+	activeMessages := buildRequestMessages(history, activeSystemPrompt, prompt, images)
 
-	for step := 0; step < 6; step++ {
-		suppressTokens := cfg.EnableShellTool && step == 0
-		answer, err := runChatRequest(ctx, baseURL, model.Name, activeHistory, activeSystemPrompt, userPrompt, activeImages, temperature, topP, timeout, suppressTokens, onToken)
+	for step := 0; step < 8; step++ {
+		req := chatReq{
+			Model:       model.Name,
+			Messages:    activeMessages,
+			Stream:      true,
+			Temperature: temperature,
+			TopP:        topP,
+		}
+		suppressTokens := false
+		if cfg.EnableShellTool {
+			req.Tools = shellToolSpec()
+			req.ToolChoice = "auto"
+			suppressTokens = true
+		}
+
+		response, err := runChatPayload(ctx, baseURL, req, timeout, suppressTokens, onToken)
 		if err != nil {
-			if len(activeImages) > 0 && strings.Contains(err.Error(), "image_url") {
-				answer, err = runLegacyChatRequest(ctx, baseURL, model.Name, activeHistory, activeSystemPrompt, userPrompt, activeImages, temperature, topP, timeout, suppressTokens, onToken)
+			if !cfg.EnableShellTool && len(images) > 0 && strings.Contains(err.Error(), "image_url") {
+				response, err = runLegacyChatRequest(ctx, baseURL, model.Name, history, activeSystemPrompt, prompt, images, temperature, topP, timeout, suppressTokens, onToken)
 			}
 			if err != nil {
 				return "", err
 			}
 		}
 		if !cfg.EnableShellTool {
-			return strings.TrimSpace(answer), nil
+			return strings.TrimSpace(response.Content), nil
 		}
-		call, ok := parseShellToolCall(answer)
-		if !ok {
-			if onToken != nil && suppressTokens {
-				onToken(answer)
+
+		if len(response.ToolCalls) == 0 {
+			if call, ok := parseShellToolCall(response.Content); ok {
+				result, err := runShellTool(ctx, call)
+				if err != nil {
+					result = "shell tool error: " + err.Error() + "\n" + result
+				}
+				activeMessages = append(activeMessages,
+					map[string]any{"role": "assistant", "content": response.Content},
+					map[string]any{"role": "user", "content": "Shell tool result:\n" + result + "\nIf the task is complete, answer the user directly. Otherwise request another tool call."},
+				)
+				continue
 			}
-			return strings.TrimSpace(answer), nil
+			if onToken != nil {
+				onToken(response.Content)
+			}
+			return strings.TrimSpace(response.Content), nil
 		}
-		result, err := runShellTool(ctx, call)
-		if err != nil {
-			result = "shell tool error: " + err.Error()
+
+		activeMessages = append(activeMessages, assistantToolCallMessage(response))
+		for _, call := range response.ToolCalls {
+			result := executeToolCall(ctx, call)
+			activeMessages = append(activeMessages, map[string]any{
+				"role":         "tool",
+				"tool_call_id": call.ID,
+				"name":         call.Function.Name,
+				"content":      result,
+			})
 		}
-		activeHistory = append(activeHistory,
-			map[string]string{"role": "user", "content": userPrompt},
-			map[string]string{"role": "assistant", "content": answer},
-			map[string]string{"role": "user", "content": "Shell tool result:\n" + result + "\nIf the task is complete, answer the user directly. Otherwise you may emit another <shell>...</shell> block."},
-		)
-		userPrompt = "Continue."
-		activeImages = nil
 	}
 	return "", errors.New("tool loop exceeded maximum steps")
 }
@@ -837,7 +934,7 @@ func (m *residentServerManager) acquire(ctx context.Context, layout Layout, cfg 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	key := residentServerKey(layout, model, threads, ctxLen)
+	key := residentServerKey(layout, model, threads, ctxLen, cfg.EnableMMProj)
 	if m.idleTimer != nil {
 		m.idleTimer.Stop()
 		m.idleTimer = nil
@@ -912,13 +1009,14 @@ func (m *residentServerManager) stopLocked() {
 	m.inUse = 0
 }
 
-func residentServerKey(layout Layout, model LocalModel, threads, ctxLen int) string {
+func residentServerKey(layout Layout, model LocalModel, threads, ctxLen int, enableMMProj bool) string {
 	return strings.Join([]string{
 		layout.BackendExePath,
 		model.LocalPath,
 		model.MMProjPath,
 		strconv.Itoa(threads),
 		strconv.Itoa(ctxLen),
+		strconv.FormatBool(enableMMProj),
 	}, "|")
 }
 
@@ -1072,34 +1170,21 @@ func exitCodeOf(err error) (int, bool) {
 	return exitErr.ExitCode(), true
 }
 
-func runChatRequest(ctx context.Context, baseURL, model string, history []map[string]string, systemPrompt, prompt string, images []Image, temperature, topP float64, timeout time.Duration, suppressTokens bool, onToken func(string)) (string, error) {
-	var builder strings.Builder
-	collect := func(token string) {
-		builder.WriteString(token)
-		if !suppressTokens && onToken != nil {
-			onToken(token)
-		}
-	}
-	req := buildRequest(model, history, systemPrompt, prompt, images, temperature, topP)
-	if err := streamChat(ctx, baseURL, req, timeout, collect); err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(builder.String()), nil
+func runLegacyChatRequest(ctx context.Context, baseURL, model string, history []map[string]string, systemPrompt, prompt string, images []Image, temperature, topP float64, timeout time.Duration, suppressTokens bool, onToken func(string)) (chatResponse, error) {
+	req := buildLegacyRequest(model, history, systemPrompt, prompt, images, temperature, topP)
+	return runChatPayload(ctx, baseURL, req, timeout, suppressTokens, onToken)
 }
 
-func runLegacyChatRequest(ctx context.Context, baseURL, model string, history []map[string]string, systemPrompt, prompt string, images []Image, temperature, topP float64, timeout time.Duration, suppressTokens bool, onToken func(string)) (string, error) {
-	var builder strings.Builder
-	collect := func(token string) {
-		builder.WriteString(token)
+func runChatPayload(ctx context.Context, baseURL string, req chatReq, timeout time.Duration, suppressTokens bool, onToken func(string)) (chatResponse, error) {
+	response, err := streamChat(ctx, baseURL, req, timeout, func(token string) {
 		if !suppressTokens && onToken != nil {
 			onToken(token)
 		}
+	})
+	if err != nil {
+		return chatResponse{}, err
 	}
-	req := buildLegacyRequest(model, history, systemPrompt, prompt, images, temperature, topP)
-	if err := streamChat(ctx, baseURL, req, timeout, collect); err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(builder.String()), nil
+	return response, nil
 }
 
 func buildEffectiveSystemPrompt(systemPrompt string, enableShellTool bool) string {
@@ -1108,19 +1193,39 @@ func buildEffectiveSystemPrompt(systemPrompt string, enableShellTool bool) strin
 	}
 	toolSpec := `
 
-You can use one tool named shell.
-When you need to run an operating system command, respond with ONLY:
+You may use the provided shell tool when local command execution is required.
+Prefer the structured tool-calling interface. If the model runtime cannot emit structured tool calls, use this exact fallback format with no extra prose:
 <shell>
 your command here
 </shell>
 
 Rules:
-- Use the shell tool only when needed.
-- Emit exactly one shell block and no extra prose when requesting tool execution.
-- After receiving shell output, continue the task and answer normally unless another command is still necessary.
+- Use tools only when needed.
+- After receiving a tool result, continue the task and answer normally unless another tool call is still necessary.
 - Assume the environment is the user's local machine.
 `
 	return strings.TrimSpace(systemPrompt + "\n" + toolSpec)
+}
+
+func shellToolSpec() []chatTool {
+	return []chatTool{{
+		Type: "function",
+		Function: chatToolFunction{
+			Name:        "shell",
+			Description: "Run a shell command on the user's local machine and return stdout/stderr.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"command": map[string]any{
+						"type":        "string",
+						"description": "The command to execute.",
+					},
+				},
+				"required":             []string{"command"},
+				"additionalProperties": false,
+			},
+		},
+	}}
 }
 
 func parseShellToolCall(answer string) (string, bool) {
@@ -1158,6 +1263,49 @@ func runShellTool(ctx context.Context, command string) (string, error) {
 	return strings.TrimSpace(text), nil
 }
 
+func executeToolCall(ctx context.Context, call chatToolCall) string {
+	if call.Function.Name != "shell" {
+		return "tool error: unsupported tool " + call.Function.Name
+	}
+
+	var args struct {
+		Command string `json:"command"`
+	}
+	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
+		return "tool error: invalid shell arguments: " + err.Error()
+	}
+	if strings.TrimSpace(args.Command) == "" {
+		return "tool error: missing shell command"
+	}
+	result, err := runShellTool(ctx, args.Command)
+	if err != nil {
+		if result == "" {
+			return "shell tool error: " + err.Error()
+		}
+		return "shell tool error: " + err.Error() + "\n" + result
+	}
+	return result
+}
+
+func assistantToolCallMessage(response chatResponse) map[string]any {
+	toolCalls := make([]map[string]any, 0, len(response.ToolCalls))
+	for _, call := range response.ToolCalls {
+		toolCalls = append(toolCalls, map[string]any{
+			"id":   call.ID,
+			"type": emptyFallback(call.Type, "function"),
+			"function": map[string]any{
+				"name":      call.Function.Name,
+				"arguments": call.Function.Arguments,
+			},
+		})
+	}
+	return map[string]any{
+		"role":       "assistant",
+		"content":    response.Content,
+		"tool_calls": toolCalls,
+	}
+}
+
 func ping(baseURL string) error {
 	client := &http.Client{Timeout: 2 * time.Second}
 	for _, ep := range []string{"/health", "/v1/models", "/"} {
@@ -1172,7 +1320,7 @@ func ping(baseURL string) error {
 	return errors.New("not ready")
 }
 
-func buildRequest(model string, history []map[string]string, systemPrompt, prompt string, images []Image, temperature, topP float64) chatReq {
+func buildRequestMessages(history []map[string]string, systemPrompt, prompt string, images []Image) []map[string]any {
 	messages := make([]map[string]any, 0, 2+len(history))
 	if strings.TrimSpace(systemPrompt) != "" {
 		messages = append(messages, map[string]any{"role": "system", "content": systemPrompt})
@@ -1189,7 +1337,7 @@ func buildRequest(model string, history []map[string]string, systemPrompt, promp
 		}
 		messages = append(messages, map[string]any{"role": "user", "content": content})
 	}
-	return chatReq{Model: model, Messages: messages, Stream: true, Temperature: temperature, TopP: topP}
+	return messages
 }
 
 func buildLegacyRequest(model string, history []map[string]string, systemPrompt, prompt string, images []Image, temperature, topP float64) chatReq {
@@ -1212,22 +1360,118 @@ func buildLegacyRequest(model string, history []map[string]string, systemPrompt,
 	return chatReq{Model: model, Messages: messages, Stream: true, Temperature: temperature, TopP: topP, ImageData: imageData}
 }
 
-func streamChat(ctx context.Context, baseURL string, payload chatReq, timeout time.Duration, onToken func(string)) error {
+type toolCallAccumulator struct {
+	order []int
+	items map[int]*chatToolCall
+}
+
+func newToolCallAccumulator() *toolCallAccumulator {
+	return &toolCallAccumulator{items: make(map[int]*chatToolCall)}
+}
+
+func (a *toolCallAccumulator) ensure(index int) *chatToolCall {
+	if index < 0 {
+		index = len(a.order)
+	}
+	if call, ok := a.items[index]; ok {
+		return call
+	}
+	call := &chatToolCall{Type: "function"}
+	a.items[index] = call
+	a.order = append(a.order, index)
+	return call
+}
+
+func (a *toolCallAccumulator) addDelta(index int, id, typ, name, arguments string) {
+	call := a.ensure(index)
+	if id != "" {
+		call.ID = id
+	}
+	if typ != "" {
+		call.Type = typ
+	}
+	if name != "" {
+		call.Function.Name += name
+	}
+	if arguments != "" {
+		call.Function.Arguments += arguments
+	}
+}
+
+func (a *toolCallAccumulator) addComplete(call chatToolCall) {
+	index := len(a.order)
+	dst := a.ensure(index)
+	*dst = call
+}
+
+func (a *toolCallAccumulator) calls() []chatToolCall {
+	out := make([]chatToolCall, 0, len(a.order))
+	for _, index := range a.order {
+		call := *a.items[index]
+		if call.ID == "" {
+			call.ID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), index)
+		}
+		if call.Type == "" {
+			call.Type = "function"
+		}
+		if strings.TrimSpace(call.Function.Name) == "" {
+			continue
+		}
+		out = append(out, call)
+	}
+	return out
+}
+
+func streamChat(ctx context.Context, baseURL string, payload chatReq, timeout time.Duration, onToken func(string)) (chatResponse, error) {
 	data, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/chat/completions", bytes.NewReader(data))
 	if err != nil {
-		return err
+		return chatResponse{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := (&http.Client{Timeout: timeout}).Do(req)
 	if err != nil {
-		return err
+		return chatResponse{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 65536))
-		return fmt.Errorf("llama-server error: %s", strings.TrimSpace(string(body)))
+		return chatResponse{}, fmt.Errorf("llama-server error: %s", strings.TrimSpace(string(body)))
+	}
+
+	acc := newToolCallAccumulator()
+	var content strings.Builder
+
+	if !payload.Stream {
+		var body struct {
+			Choices []struct {
+				Message struct {
+					Content   string         `json:"content"`
+					ToolCalls []chatToolCall `json:"tool_calls"`
+				} `json:"message"`
+				Text string `json:"text"`
+			} `json:"choices"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			return chatResponse{}, err
+		}
+		for _, choice := range body.Choices {
+			text := choice.Message.Content
+			if text == "" {
+				text = choice.Text
+			}
+			if text != "" {
+				content.WriteString(text)
+				if onToken != nil {
+					onToken(text)
+				}
+			}
+			for _, call := range choice.Message.ToolCalls {
+				acc.addComplete(call)
+			}
+		}
+		return chatResponse{Content: strings.TrimSpace(content.String()), ToolCalls: acc.calls()}, nil
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -1239,16 +1483,26 @@ func streamChat(ctx context.Context, baseURL string, payload chatReq, timeout ti
 		}
 		raw := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if raw == "[DONE]" {
-			return nil
+			return chatResponse{Content: strings.TrimSpace(content.String()), ToolCalls: acc.calls()}, nil
 		}
 
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Content string `json:"content"`
+					Content   string `json:"content"`
+					ToolCalls []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Type     string `json:"type"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
 				} `json:"delta"`
 				Message struct {
-					Content string `json:"content"`
+					Content   string         `json:"content"`
+					ToolCalls []chatToolCall `json:"tool_calls"`
 				} `json:"message"`
 				Text string `json:"text"`
 			} `json:"choices"`
@@ -1265,11 +1519,23 @@ func streamChat(ctx context.Context, baseURL string, payload chatReq, timeout ti
 				token = choice.Text
 			}
 			if token != "" {
-				onToken(token)
+				content.WriteString(token)
+				if onToken != nil {
+					onToken(token)
+				}
+			}
+			for _, call := range choice.Delta.ToolCalls {
+				acc.addDelta(call.Index, call.ID, call.Type, call.Function.Name, call.Function.Arguments)
+			}
+			for _, call := range choice.Message.ToolCalls {
+				acc.addComplete(call)
 			}
 		}
 	}
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return chatResponse{}, err
+	}
+	return chatResponse{Content: strings.TrimSpace(content.String()), ToolCalls: acc.calls()}, nil
 }
 
 func freePort() (int, error) {
