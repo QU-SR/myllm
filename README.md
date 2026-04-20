@@ -9,8 +9,10 @@
 - **文本 + 图片** — 支持纯文本对话和图片理解（需视觉模型 + mmproj）
 - **可编辑系统提示词** — 直接编辑 `config/system_prompt.txt` 自定义助手行为
 - **CPU 优先** — 默认使用 CPU 推理，无需 GPU；也可通过外部 `llama-server` 接入 GPU
-- **模型常驻** — 可选将模型常驻内存，空闲后自动释放，兼顾速度与资源
-- **Shell 工具** — 可选启用，让模型通过 `<shell>...</shell>` 标签执行本地命令
+- **后台常驻** — 交互界面关闭后后台 daemon 继续运行，Windows 托盘可重新打开聊天界面
+- **OpenAI 兼容 API** — 后台 daemon 暴露 `/v1/models` 和 `/v1/chat/completions`
+- **模型常驻** — 默认将模型常驻内存，可配置空闲后自动释放，兼顾速度与资源
+- **Shell 工具** — 可选启用，优先使用 OpenAI tool_calls 多轮工具流程，并保留 `<shell>...</shell>` 兜底
 - **流式输出** — 实时逐 token 显示生成内容
 - **Ollama 兼容** — 支持 `myllm pull <名称>` 从 Ollama 注册表下载模型
 
@@ -49,6 +51,7 @@ myllm run vision --image ./cat.jpg "描述这张图片"
 | `myllm run <名称> [提示文本]` | 单次运行模型 |
 | `myllm doctor` | 检查运行环境（后端、模型数量等） |
 | `myllm bench` | 输出推荐的 CPU 线程数 |
+| `myllm daemon` | 启动后台 daemon、托盘入口和 OpenAI 兼容 API |
 | `myllm help` | 显示帮助信息 |
 
 ### run 命令参数
@@ -67,6 +70,25 @@ myllm run <名称> [提示文本] [选项]
 ## 交互式界面
 
 运行 `myllm`（无参数）或双击 `myllm.exe` 进入交互式聊天。
+
+启动交互式界面时会自动拉起后台 daemon。关闭聊天窗口不会释放后台进程；在 Windows 右下角托盘中点击 myllm 图标，可选择“打开聊天界面”重新进入。
+
+### OpenAI 兼容 API
+
+后台 daemon 默认监听：
+
+```text
+http://127.0.0.1:48991/v1
+```
+
+可用接口：
+
+```text
+GET  /v1/models
+POST /v1/chat/completions
+```
+
+端口可在 `config/config.json` 中通过 `daemon_port` 调整。
 
 ### 斜杠命令
 
@@ -141,7 +163,7 @@ Windows 下建议直接使用官方 `llama.cpp` 发布包里的整套文件，�
 
 `myllm doctor` 会检查这些 DLL 是否齐全；程序启动时也会优先尝试从当前系统自动补齐到 `backends/`。如果目标机器没有安装 Visual C++ Redistributable，就必须把这些 DLL 随程序一起打包。
 
-程序会在每次提问时自动启动后端进程、完成推理后关闭，不会留下常驻后台服务（除非启用了模型常驻模式）。
+程序会在首次打开交互界面时自动启动后台 daemon。daemon 负责复用 `llama-server` 和模型内存，并在 Windows 托盘中提供重新打开聊天界面的入口；如需彻底释放模型，可在托盘菜单中选择“退出后台”。
 
 ## 技术栈
 
